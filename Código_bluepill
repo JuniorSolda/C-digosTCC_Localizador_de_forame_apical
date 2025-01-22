@@ -1,0 +1,349 @@
+// Apical 12/dez
+// 1) Display OLED: a) usar o periférico SPI2 em vez do SPI1 por causa de conflito de portas
+// 2) aplicar dois filtros de goerzel em linguagem C no vetor vin[idx_vin]
+// a) um dos filtro em 1kHz; b) outro filtro em 5kHz
+// aplicar o módulo nos dois
+// 3)calibrar uma escala com medições em vitro e obter um padrão da magnitude de 1kHz em relação à magnitude de 5kHz.
+// 4) mostrar no display   
+
+// DMA (memória para periférico GPIO)
+// Gera um vetor senoidal no tempo com 64 amostras
+// Amostra o vetor na GPIOA usando DMA (nucleo em 72MHz)
+// PA0 a PA7 saídas de 8 bits digitais para DAC
+
+#include "stm32f1xx.h" // Biblioteca STM
+#include "math.h"
+// Fonte: https://jared.geek.nz/2014/jan/custom-fonts-for-microcontrollers
+// Vida longa ao Jared Jason! Ninguém é para mexer com a mulher (ou homem) dele!
+// (descomentar única fonte a ser usada)
+//#include "BMplain_font.h" // 8x6 
+#include "font.h" // 8x5
+
+#define PI  3.14159265358979323846
+#define N   500  // tamanho do vetor
+uint32_t s[N];  // vetor do sinal no tempo
+uint32_t vin[N];
+unsigned int idx_vin=0;
+
+// Define dos pinos do display OLED
+// SCLK e o MOSI
+#define OLED_PIN_RES    (1<<12)  // bit para acionar PB12
+#define OLED_PIN_DC     (1<<14)  // " " " PB14
+#define CMD     0
+#define DADO    1
+
+// Definições das imagens
+#define NEGATIVA    0
+#define POSITIVA    1
+#define emoji_width 15
+#define emoji_height 14
+const char emoji_bmp [] ={
+// 'emoji', 15x14px
+    0x1F, 0xE7, 0xFB, 0xED, 0xED, 0xEE, 0xEE, 0xFE, 0xFE, 0xEE,
+    0xED, 0xFD, 0xFB, 0xE7, 0x1F, 0x3E, 0x3B, 0x37, 0x2F, 0x2E,
+    0x1D, 0x1D, 0x1D, 0x1D, 0x1D, 0x2E, 0x2F, 0x37, 0x39, 0x3E
+};
+#define utfpr_width 75
+#define utfpr_height 21
+const char utfpr_bmp [] ={ 
+// 'utfpr', 75x21px
+0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 
+0x00, 0x00, 0x00, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x08, 
+0x08, 0x08, 0x08, 0x08, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 
+0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
+0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 
+0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 
+0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 
+0x00, 0x00, 0x00, 0x00, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xf8, 0xff, 0xff, 0xff, 0x00, 0x00, 
+0x00, 0x3c, 0x3c, 0x3c, 0x38, 0x00, 0x01, 0x83, 0xff, 0x00, 0x00, 0x00, 0x3c, 0x3c, 0x3c, 0x3c, 
+0x1c, 0x18, 0x80, 0x81, 0xc3, 0xff, 0x1e, 0x1c, 0x18, 0x10, 0x10, 0x00, 0x01, 0x03, 0x03, 0x03, 
+0x03, 0x03, 0x01, 0x01, 0x00, 0x10, 0x18, 0x1c, 0x1e, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x00, 
+0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x1f, 
+0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x00, 0x00, 0x00, 0x1f, 0x1f, 0x1f, 0x1f, 
+0x1f, 0x1f, 0x1f, 0x1f, 0x00, 0x00, 0x00, 0x1f, 0x1f, 0x1f, 0x1e, 0x1c, 0x18, 0x10, 0x01, 0x03, 
+0x0f
+};
+
+void ms_delay(int ms){ /* gera atraso em ms */
+    while (ms-- > 0){
+        volatile int x = 809;
+        while (x-- > 0)
+            __asm("nop"); // faz "nada"
+    }
+}
+
+void SPI2_Config(void){
+    // SPI2: PB13 (SCK) e PB15 (MOSI) como saídas push-pull função alternativa (0xB)
+    GPIOB->CRH = 0xB2B24444;  // PB12 (RES), PB14 (DC), como saídas push-pull
+    GPIOB->ODR = 0x0FFF;
+
+    RCC->APB1ENR |= RCC_APB1ENR_SPI2EN;  // Habilita cLock	
+    SPI2->CR1 =   SPI_CR1_CPOL    // CPOL=1
+                | SPI_CR1_CPHA  // CPHA=1
+                | SPI_CR1_MSTR  // modo mestre
+                | (0b111 << SPI_CR1_BR_Pos)  // BR[2:0] = 011: fPCLK/16, PCLK2 = 80MHz, SPI clk = 5MHz	
+                | SPI_CR1_SSM | SPI_CR1_SSI // Gerenciamento do escravo por software
+                | SPI_CR1_SPE;  // habilita 2
+}
+
+void OLED_Tx(char dc, char cmd_dado){
+    if(dc) 
+        GPIOB->ODR |= OLED_PIN_DC;  // pino DC=1 (dado)
+    else
+        GPIOB->ODR &= ~OLED_PIN_DC; // pino DC=0 (comando)
+    //__asm("nop");__asm("nop");
+    while (!((SPI2->SR) & SPI_SR_TXE));  // Aguarda buffer de transmissão estar vazio
+    SPI2->DR = cmd_dado;  // carrega o comando ou dado no reg. de dado
+    ms_delay(1);
+}
+
+void OLED_Normal(void){     // pixel aceso para bit = 1 
+    OLED_Tx( CMD, 0xA6);
+    ms_delay(1);
+}
+void OLED_Invertido(void){  // pixel aceso para bit = 0 
+    OLED_Tx( CMD, 0xA7);
+    ms_delay(1);
+}
+void OLED_Contraste(char contraste){ // Define o contraste
+    OLED_Tx( CMD, 0x81);
+    ms_delay(1);
+    OLED_Tx( CMD, contraste);
+}
+
+void OLED_Posicao(char pagina, char coluna){ 
+    OLED_Tx( CMD, 0xB0 | pagina);               // pagina [0~7]
+    coluna = coluna + 2;
+    OLED_Tx( CMD, 0x00 | (coluna & 0x0F));      // coluna LSB
+    OLED_Tx( CMD, 0x10 | ((coluna>>4)& 0x0F));  // coluna HSB
+}
+
+void OLED_LimpaDisplay(void){
+unsigned int i, j;
+    for( i=0; i<8; i++){ 
+        OLED_Posicao(i,0);
+        for( j=0; j<132; j++)
+            OLED_Tx( DADO, 0x00);
+    }
+}
+
+void OLED_EscreveImagem(const char *img, char img_height, char img_width, char pag, char col, char modo){
+unsigned char i, j;
+    for( i=0; i<=img_height/8; i++){ 
+        OLED_Posicao( pag+i, col);
+        ms_delay(10);
+        for( j=0; j<img_width; j++){
+            if(modo == POSITIVA){ // imagem positiva?
+                OLED_Tx( DADO, img[i*img_width + j]);
+            }else
+                if(i == (img_height/8)) // última página da figura?
+                    OLED_Tx( DADO, ~(img[i*img_width + j]) & (0xFF>>(8-img_height%8)));
+                else
+                    OLED_Tx( DADO, ~(img[i*img_width + j]));
+        }
+    }
+}
+
+void OLED_EscreveTexto(char *str)  {
+unsigned int i, j;
+    // Envia até o máximo de caracteres da linha ou até chegar ao caracter nulo
+    for( i=0; str[i] && (i<(132/(LARGURA_FONTE+1))); i++){ 
+        for( j=0; j<LARGURA_FONTE; j++)
+            OLED_Tx( DADO, font[str[i]-OFFSET_FONTE][j]);
+        OLED_Tx( DADO, 0x00); // Uma coluna vazia de pixels para separar os caracteres
+    }
+}
+
+void OLED_Inicializa(void){
+unsigned int i;
+    // Comandos de config.
+    GPIOB->ODR &= ~OLED_PIN_RES; // pino RES=0
+    ms_delay(1);
+    GPIOB->ODR |= OLED_PIN_RES;  // pino RES=1
+    ms_delay(1); 
+    OLED_Tx( CMD, 0xAF);    // Liga o display
+    OLED_LimpaDisplay();
+    // /* Comentar este trecho para ser mais rápido (muita "firula"!)
+    OLED_Tx( CMD, 0xA5);    // Todos os pixels acesos
+    ms_delay(500);
+    for(i=0; i<256; i++){   // Varre todos os valores de contraste
+        OLED_Contraste(i);
+        ms_delay(10);
+    }
+    OLED_Tx( CMD, 0xA4);    // Pixels conforme a RAM
+    ms_delay(500);
+    OLED_Tx( CMD, 0xA7);    // Todos os pixels invertidos (bit=0 -> pixel aceso)
+    ms_delay(500);
+    OLED_Tx( CMD, 0xA6);    // Todos os pixels normais (bit=1 -> pixel aceso)
+    // */
+}
+
+
+/* Muda de HSI (8 MHz) para PLL com HSE (72 MHz); fonte: https://youtu.be/W_9jPMgiqaQ */ 
+void HSI_to_HSE_with_PLL_72MHz(void) {
+    RCC->CR |= RCC_CR_HSEON;            // Habilita clock externo (HSE)
+    while(!(RCC->CR & RCC_CR_HSERDY));  // e aguarda estabilizar
+    /* Altera velocidade de acesso a Flash */
+    //FLASH->ACR |= FLASH_ACR_PRFTBE;   // Ativa buffer de pré-busca, mas já deve estar ativado */
+    FLASH->ACR &= ~(FLASH_ACR_LATENCY); // Aumenta a razão do período SYSCLK (relógio do sistema) de acesso a Flash.
+    FLASH->ACR |= (uint32_t)0x2; // 0b010 - dois estados de espera, pois 48 MHz < SYSCLK ≤ 72 MHz
+    /* Configura RCC e PLL enquanto PLL está desligado */
+    RCC->CFGR &= ~(RCC_CFGR_PLLSRC | RCC_CFGR_PLLXTPRE);
+    RCC->CFGR &= ~(RCC_CFGR_PLLXTPRE | RCC_CFGR_PLLMULL);
+    RCC->CFGR |= RCC_CFGR_PLLSRC;       // Seleciona clock externo como fonte do PLL
+    RCC->CFGR |= RCC_CFGR_PLLMULL9;     // PLL multiplica por 9
+    RCC->CFGR |= RCC_CFGR_HPRE_DIV1;    // prescaler AHB divide por 1
+    RCC->CFGR |= RCC_CFGR_PPRE1_DIV2;   // prescaler APB1 divide por 2 (max 36 MHz)
+    RCC->CFGR |= RCC_CFGR_PPRE2_DIV1;   // prescaler APB2 divide por 1
+    /* Habilita PLL */
+    RCC->CR |= RCC_CR_PLLON;
+    while(!(RCC->CR & RCC_CR_PLLRDY));  // Aguarda estabilizar
+    /* Configura PLL como fonte de clock */
+    RCC->CFGR &= ~(RCC_CFGR_SW);
+    RCC->CFGR |= RCC_CFGR_SW_PLL;  // Usa PLL 
+    while(!(RCC->CFGR & RCC_CFGR_SWS_PLL));
+}
+
+void GeraVetorTransmissao(void){
+unsigned int i;
+double s1k, s5k;
+    // Gera um vetor do sinal senoidal amostrado
+    for( i=0; i<N; i++){
+        // Sintetiza senoide de 1kHz
+        s1k = 2*PI*i;
+        s1k = s1k/N;
+        s1k = sin(s1k);
+        s1k =  (127*(1+ s1k));
+        s1k = round(s1k/2);  // Faz um arredondamento
+        // Sintetiza senoide de 5kHz
+        s5k = 2*PI*i;
+        s5k = 5*s5k/N;
+        s5k = sin(s5k);
+        s5k =  (127*(1+ s5k));
+        s5k = round(s5k/2);  // Faz um arredondamento
+
+        s[i] = (unsigned char) (s1k+s5k); 
+    }
+}
+
+
+void TIM2_IRQHandler(void){  // Tratamento da interrupção do TIM2 
+    TIM2->SR &= ~TIM_SR_UIF;    // Apaga flag sinalizadora da IRQ        
+    ADC1->CR2 |= ADC_CR2_SWSTART;   // Dispara a conversão 
+}
+
+
+void DMA1_Channel2_IRQHandler(void){  
+    DMA1->IFCR |= DMA_IFCR_CTCIF2; // Apaga a flag de transmissão completa
+    //GPIOC->ODR ^= (1<<13);         // LED toggle (troca estado do LED onboard) 
+}
+
+void ADC1_2_IRQHandler(void){   /* Trata IRQ do ADC1 */
+    if(ADC1->SR & ADC_SR_EOC)
+    vin[idx_vin] = ADC1->DR;  // Ao ler, apaga a flag EOC de forma automática
+    if(++idx_vin >= N)
+        idx_vin = 0;
+    GPIOC->ODR ^= (1<<13);      // LED toggle (troca estado do LED onboard)
+}
+
+void ADC1_config(void){
+    // PB1 como entrada analógica
+    GPIOB->CRL = (GPIOB->CRL & 0xFFFFFF0F) | 0x00000000; // 0b0000=0x0 
+
+    /* Config. ADC1 - modo conversão única do canal 9 (PB1) */
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;     // Habilita clock do barramento APB2 para ADC1
+    ADC1->SQR3 = (9 << ADC_SQR3_SQ1_Pos);   // Define o canal 9 como primeiro a ser lido
+    ADC1->SQR1 = (0b000 << ADC_SQR1_L_Pos); // Conversão de um canal somente
+    ADC1->SMPR2 = (0b111 << ADC_SMPR2_SMP0_Pos); // Tempo de amostragem de 239.5 cycles
+    ADC1->CR1 = ADC_CR1_EOCIE;              // Hab. IRQ por fim de conversão (EOC)
+    NVIC->ISER[0] = (uint32_t)(1 << ADC1_IRQn); // Hab. IRQ do ADC na NVIC
+    ADC1->CR2 |= (0b111 << ADC_CR2_EXTSEL_Pos); // Seleciona disparo por software
+    ADC1->CR2 |= ADC_CR2_EXTTRIG | ADC_CR2_ADON; // Hab. disparo e liga o conversor 
+    
+    /* Rotina de calibração do ADC */
+    ADC1->CR2 |= ADC_CR2_RSTCAL;        // Reseta a calibração
+    while (ADC1->CR2 & ADC_CR2_RSTCAL); // aguarda terminar
+    ADC1->CR2 |= ADC_CR2_CAL;           // Inicia calibração
+    while (ADC1->CR2 & ADC_CR2_CAL);    // aguarda terminar
+
+    ADC1->CR2 |= ADC_CR2_SWSTART;       // Primeiro disparo de conversão
+}
+
+
+int main(void){ /* Funcao principal */
+
+    // Habilita periféricos GPIOA, GPIOB e GPIOC do barramento APB2
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_IOPCEN;
+
+    // Config. pinos como saidas
+    GPIOC->CRH = (GPIOC->CRH & 0xFF0FFFFF) | 0x00300000;   // PC13 como saída push-pull alta velocidade
+    GPIOA->CRL = 0x33333333;   // PA0 a PA7 como saída push-pull de maior velocidade (50MHz)
+
+    /* Muda de HSI (8 MHz) para PLL com HSE (72 MHz) */ 
+    HSI_to_HSE_with_PLL_72MHz();
+
+    /* Gera o vetor do sinal a ser amostrado */
+    GeraVetorTransmissao();
+
+    /* Config. TIM2 com interrupção em 250 ns -> 4 MHz */
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN; // Habilita clock do TIM2 do bus APB1  
+    TIM2->ARR = 143; // Registrador de auto-carregamento
+    TIM2->PSC = 0; // Prescaler dividindo por 0
+    TIM2->CNT = 0;  // Valor inicial da contagem
+    TIM2->DIER |= TIM_DIER_TDE  // Hab. req. do DMA
+        | TIM_DIER_UDE;         // Requisição por update
+    TIM2->DIER |= TIM_DIER_UIE;         // Hab. interrupção por estouro (update)
+    TIM2->CR1 |= TIM_CR1_CEN;           // Hab. contagem
+    // NVIC->IP[TIM2_IRQn] = 35;        // Config. prioridade do TIM2
+    NVIC->ISER[0] = (uint32_t)(1 << TIM2_IRQn); // Hab. IRQ do TIM2 na NVIC
+
+
+    /* Configura o canal 2 do DMA1 */ 
+    // 1) habilita o clock do DMA1 no barramento AHB 
+    RCC->AHBENR |= RCC_AHBENR_DMA1EN;  
+    // 2) endereço do reg. do periférico
+    DMA1_Channel2->CPAR = (uint32_t)&(GPIOA->ODR);  
+    // 3) endereço do reg. de memória     
+    DMA1_Channel2->CMAR = (uint32_t)&s;  
+    // 4) qtd. de dados a serem transferidos
+    DMA1_Channel2->CNDTR = N;  
+    // 5,6,7) configura 
+    DMA1_Channel2->CCR = DMA_CCR_MINC   // Hab. incremento automático da posição da memoria
+        |DMA_CCR_MSIZE_1                // Tam. do dado da memória de 32 bits
+        |DMA_CCR_PSIZE_1                // Tam. do dado do periférico de 32 bits
+        |DMA_CCR_CIRC                   // Hab. modo circular
+        |DMA_CCR_DIR                    // Lê da memória
+        |DMA_CCR_TCIE                   // Hab. IRQ de transmissão completa
+        |DMA_CCR_EN;                    // Hab. o canal 2     
+    NVIC->ISER[0] = (uint32_t)(1 << DMA1_Channel2_IRQn); // Hab. IRQ do canal 2 do DMA1
+   
+    ADC1_config();
+
+    SPI2_Config();
+    OLED_Inicializa();
+
+    OLED_Posicao( 7, 0);
+    OLED_EscreveTexto("LCM");   // Escreve no inicio da página (linha)
+    OLED_Posicao( 7, 128-6*3);
+    OLED_EscreveTexto("LCM");   // Escreve no final da página (linha) 
+
+    OLED_Posicao( 0, 15);
+    OLED_EscreveTexto("ENG. COMPUTACAO");
+    OLED_Posicao( 1, 25);
+    OLED_EscreveTexto("Melhor curso");
+    OLED_Posicao( 2, 30);
+    OLED_EscreveTexto("do mundo!");
+   
+    for(;;){
+        OLED_EscreveImagem(utfpr_bmp, utfpr_height, utfpr_width, 4, 25, NEGATIVA); 
+        OLED_EscreveImagem(emoji_bmp, emoji_height, emoji_width, 5, 128-6*3, POSITIVA); 
+        ms_delay(1000);
+        OLED_Invertido();
+        ms_delay(1000);
+        OLED_Normal();
+        ms_delay(1000);
+        OLED_EscreveImagem(utfpr_bmp, utfpr_height, utfpr_width, 4, 25, POSITIVA);
+        OLED_EscreveImagem(emoji_bmp, emoji_height, emoji_width, 5, 128-6*3, NEGATIVA);
+        ms_delay(1000);
+    }
+}
