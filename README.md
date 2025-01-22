@@ -1,4 +1,4 @@
-# CódigosTCC_Localizador_de_forame_apical
+# TCC_Localizador_de_forame_apical
 
 Código em linguagem C para ser utilizado na BluePill!
 
